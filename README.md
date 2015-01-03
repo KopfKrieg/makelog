@@ -3,6 +3,13 @@ makelog
 
 Creates nice (and rather useless) graphs from lighttpd/apache/etc access-logs
 
+## Requirements/Setup
+
+- The makelog-script from this repository
+- Python3
+- Paramiko for python3 if you use the --update-function
+- Matplotlib for python3 to generate graphs
+
 ## Usage
 
 - -h, --help → Shows the help
