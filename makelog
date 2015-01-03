@@ -1,0 +1,893 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+
+## Readme | http://github.com/revogit/makelog.git
+#
+# Makelog - accesslog analyzer for lighttpd
+#
+## Default accesslog format for lighttpd (version >= 1.4.13)
+#   accesslog.format = "%h %V %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\""
+#   %h      name or address of remote host
+#   %V      HTTP request host name
+#   %u      authenticated user
+#   %t      timestamp of the end-time of request
+#   "%r"    request line
+#   %>s     status code
+#   %b      bytes sent for the body (payload)
+#   "%{Referer}i"       Referer
+#   "%{User-Agent}i"    User-Agent
+
+
+## Imports
+import argparse
+import datetime
+import getpass
+import json
+import os
+import random
+import sqlite3
+import time
+# External
+import paramiko
+
+
+## Class
+
+class Logalyze:
+    def __init__(self, debug=False):
+        ## Basic setup
+        self._debug = debug
+        # Pathes
+        self.workingPath = os.getcwd()  # Not the script-location!
+        self.confFile = os.path.join(self.workingPath, 'makelog.conf')
+        self.database = os.path.join(self.workingPath, 'makelog.db')
+        self.logFolder = os.path.join(self.workingPath, 'logfiles')    # Folder for logfiles
+        # Default configuration, use loadConfiguration() to override
+        self.anonymizeIp = True     # If True, the last byte of an ip-address is randomized
+        self.identFile = None       # Identify file for remote login, None if password login is preferred over publickey authentication
+        self.remoteHost = None      # Remote host
+        self.remotePath = None      # Location of logfiles on the remote host
+        self.remotePort = 22        # Remote port
+        self.remoteUsername = None  # Username for remote login
+        self.domains = [None]       # List of domains for export()-function
+        self.exportPath = 'export'  # Export path for export()-function
+        self.exportWidth = 650      # Width of graphik to export
+        ## Run
+        if not os.path.exists(self.confFile):
+            self.storeConfiguration()
+            return
+        else:
+            self.loadConfiguration()
+        # Create missing logFolder
+        if not os.path.exists(self.logFolder):
+            self.debug('Create folder: {}'.format(self.logFolder))
+            os.makedirs(self.logFolder)
+
+
+    def debug(self, text):
+        """
+        Prints debug text if self._debug is True
+
+        @param text: Text to print
+        @type text: str
+        """
+        if self._debug:
+            print('{}'.format(text))
+
+
+    def loadConfiguration(self):
+        """
+        Load configuration from self.confFile and set values (self.$variable)
+        """
+        self.debug('Load Configuration {}'.format(self.confFile))
+        with open(self.confFile, 'r') as fIn:
+            conf = json.load(fIn)
+        rewrite = False
+        keys = ['anonymizeIp', 'identFile', 'remoteHost', 'remotePath', 'remotePort', 'remoteUsername', 'domains', 'exportPath', 'exportWidth']
+        for key in keys:
+            try:
+                exec('self.{} = conf[\'{}\']'.format(key, key))
+            except KeyError as e:
+                self.debug('  KeyError: {}'.format(e))
+                rewrite = True
+        # And rewrite if necessary
+        if rewrite:
+            self.storeConfiguration()
+
+
+    def storeConfiguration(self):
+        """
+        Store configuration into self.confFile (values read from self.$variable)
+        """
+        self.debug('Store Configuration {}'.format(self.confFile))
+        keys = ['anonymizeIp', 'identFile', 'remoteHost', 'remotePath', 'remotePort', 'remoteUsername', 'domains', 'exportPath', 'exportWidth']
+        conf = dict()
+        for key in keys:
+            exec('conf[\'{}\'] = self.{}'.format(key, key))
+        with open(self.confFile, 'w') as fOut:
+                json.dump(conf, fOut, sort_keys=True, indent=2)
+
+
+    def update(self):
+        """
+        Connect to remote host and download new logfiles, remove them after downloading
+        """
+        self.debug('Updating files from remote')
+        # Connect
+        self.connect()
+        # If path exists
+        if self.remotePathExists():
+            # Get a list of all files
+            filesAll = self.sftp.listdir(self.remotePath)
+            # Download and remove
+            for item in filesAll:
+                self.pull(item)
+                self.sftp.remove(os.path.join(self.remotePath, item))
+        else:
+            print('Path does not exists {}'.format(self.remotePath))
+        # Disconnect
+        self.disconnect()
+
+
+    def connect(self):
+        """
+        Connect to remote host
+        """
+        self.debug('Connect to remote host')
+        try:
+            if self._transport.is_active():
+                return  # Return if a transport is already opened. This could cause problems if, for example, the transport is open but the sftpclient is inactive/dead/etc
+        except AttributeError:  # self._transport is not defined, so we should open it
+            pass
+        self._transport = paramiko.Transport((self.remoteHost, self.remotePort))
+        self.sftp = None
+        if self.identFile is None:
+            self.debug('  Use password login')
+            try:
+                self._transport.connect(username=self.remoteUsername, password=getpass.getpass('    Password for remote host? '))
+            except paramiko.ssh_exception.BadAuthenticationType:
+                self.debug('      Hm. Login with password doesn\'t work. Did you set „identFile“ in {}?'.format(self.confFile))
+                raise Exception('Remote host doesn\'t accept passwords')
+        else:
+            self.debug('  Use identity file for login')
+            key = None
+            identFile = os.path.expanduser(self.identFile)
+            try:
+                key = paramiko.RSAKey.from_private_key_file(identFile)
+            except paramiko.ssh_exception.PasswordRequiredException:
+                key = paramiko.RSAKey.from_private_key_file(identFile, password=getpass.getpass('    Password for identity file? '))
+            self._transport.connect(username=self.remoteUsername, pkey=key)
+        self.sftp = paramiko.SFTPClient.from_transport(self._transport)
+        self.debug('  Connected to remote host {}@{}:{}'.format(self.remoteUsername, self.remoteHost, self.remotePort))
+        # Check remotePath | Path like /home/$remoteUsername/makelog on the remote device!
+        if self.remotePath is None:
+            self.debug('  Create default remotePath')
+            self.remotePath = os.path.join(self.sftp.normalize('.'), 'makelog')
+            self.debug('    {}'.format(self.remotePath))
+            self.storeConfiguration()
+
+
+    def remotePathExists(self, remotePathRel=''):
+        """
+        Returns True if $self.remotePath/remotePathRel exists
+
+        @param remotePathRel: The relative path to the file on the server
+        @type remotePathRel: str
+        @return: Returns True if the file exists and False if not
+        """
+        self.debug('Remote path exists {}'.format(os.path.join(self.remotePath, remotePathRel)))
+        try:
+            self.sftp.stat(os.path.join(self.remotePath, remotePathRel))
+        except IOError as e:
+            if e.errno == errno.ENOENT: # No such file or directory | http://stackoverflow.com/questions/850749/check-whether-a-path-exists-on-a-remote-host-using-paramiko
+                return False
+            raise e
+        return True
+
+
+    def pull(self, remotePathRel):
+        """
+        Pulls a file from self.remotePath/remotePathRel into self.logFolder/filename via SFTP
+
+        @param remotePathRel: Relative path of the remote file
+        @type remotePathRel: str
+        """
+        self.debug('Downloading {}'.format(remotePathRel))
+        filename = os.path.basename(remotePathRel)
+        localPath = os.path.join(self.logFolder, filename)
+        remotePathAbs = os.path.join(self.remotePath, remotePathRel)
+        self.sftp.get(remotePathAbs, localPath, callback=self.callbackTransferStatus)
+
+
+    def callbackTransferStatus(self, bytesT, bytesA):
+        try:
+            self.debug('  Transferred {} of {} Bytes ({:.2f} %)'.format(bytesT, bytesA, bytesT/bytesA*100))
+        except ZeroDivisionError as e:
+            self.debug('Division by zero {}/{}'.format(bytesT, bytesA))
+            raise ZeroDivisionError('A ZeroDivisionError occured and that means something went wrong. Check your files!')
+
+
+    def disconnect(self):
+        """
+        Disconnect from server
+        """
+        self.debug('Disconnect from remote host')
+        self.sftp.close()
+        self._transport.close()
+        self.debug('  Disconnected from remote host')
+
+
+    def process(self):
+        """
+        Open logfiles, process them, put the data into our database
+        """
+        self.debug('Processing logfiles')
+        # Connect to database
+        self.debug('  Connect to database')
+        con = sqlite3.connect(self.database)
+        cur = con.cursor()
+        # Create table if not exists
+        cur.execute('''CREATE TABLE IF NOT EXISTS logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source TEXT,
+                        destination TEXT,
+                        timestamp REAL,
+                        request TEXT,
+                        statuscode INTEGER,
+                        bytecount INTEGER,
+                        referer TEXT,
+                        useragent TEXT
+                       )''')
+        con.commit()
+        # Connect to :memory:
+        tmpCon = sqlite3.connect(':memory:')
+        tmpCur = tmpCon.cursor()
+        # Create table if not exists
+        tmpCur.execute('''CREATE TABLE IF NOT EXISTS logs (
+                           id INTEGER PRIMARY KEY AUTOINCREMENT,
+                           source TEXT,
+                           destination TEXT,
+                           timestamp REAL,
+                           request TEXT,
+                           statuscode INTEGER,
+                           bytecount INTEGER,
+                           referer TEXT,
+                           useragent TEXT
+                          )''')
+        tmpCon.commit()
+        # Processing files
+        fileNames = os.listdir(self.logFolder)
+        fileNames.sort()
+        # For every file
+        for index, fileName in enumerate(fileNames, start=1):
+            self.debug('  Processing file {} of {}: {}'.format(index, len(fileNames), fileName))
+            delete = True
+            # Setup lines, open file
+            lines = None
+            with open(os.path.join(self.logFolder, fileName), 'r') as fIn:
+                lines = fIn.read().split('\n')
+            # Declare variables
+            source = None
+            destination = None
+            timestamp = None
+            request = None
+            statuscode = None
+            bytecount = None
+            referer = None
+            useragent = None
+            # Process line by line
+            self.debug('    Processing {} entries'.format(len(lines)))
+            for line in lines:
+                if len(line) > 1:
+                    # Split
+                    source, destination, timestamp, request, statuscode, bytecount, referer, useragent = self.splitLine(line)
+                    if self.anonymizeIp:
+                        source = self.genIp(source)
+                    #self.debug('    Info')
+                    #self.debug('      source      {}'.format(source))
+                    #self.debug('      destination {}'.format(destination))
+                    #self.debug('      timestamp   {}'.format(timestamp))
+                    #self.debug('      request     {}'.format(request))
+                    #self.debug('      statuscode  {}'.format(statuscode))
+                    #self.debug('      bytecount   {}'.format(bytecount))
+                    #self.debug('      referer     {}'.format(referer))
+                    #self.debug('      useragent   {}'.format(useragent))
+                    # Insert into database
+                    cur.execute("INSERT INTO logs(id, source, destination, timestamp, request, statuscode, bytecount, referer, useragent) values (?, ?, ?, ?, ?, ?, ?, ?, ?)", (None, source, destination, timestamp, request, statuscode, bytecount, referer, useragent))
+                    tmpCur.execute("INSERT INTO logs(id, source, destination, timestamp, request, statuscode, bytecount, referer, useragent) values (?, ?, ?, ?, ?, ?, ?, ?, ?)", (None, source, destination, timestamp, request, statuscode, bytecount, referer, useragent))
+                else:
+                    self.debug('      Ignored entry „{}“'.format(line))
+            # Commit new data
+            con.commit()
+            tmpCon.commit()
+            # If everything went fine, delete source file
+            if delete:
+                os.remove(os.path.join(self.logFolder, fileName))
+        # Commit changes
+        self.debug('  Commit changes: New entries')
+        con.commit()
+        tmpCon.commit()
+        # Build stats
+        self.buildStats(con, tmpCon)
+        # Commit changes
+        self.debug('  Commit changes: Building stats-tables')
+        con.commit()
+        tmpCon.commit()
+        # Disconnect from database
+        self.debug('  Disconnect from database')
+        tmpCur.close()
+        tmpCon.close()
+        cur.close()
+        con.close()
+
+    def genIp(self, ip):
+        """
+        Randomizes the last byte of an IPv4 address
+
+        @param ip: IP address
+        @type ip: str
+        @return: IP address where the last byte is randomized
+        """
+        blocks = ip.split('.')
+        return '{}.{}.{}.{}'.format(blocks[0], blocks[1], blocks[2], random.randint(1,255))
+
+
+    def splitLine(self, line):
+        """
+        Split line from logfile into a few variables and return them
+
+        @param line: Line to process
+        @type line: str
+        @return: Returns source, destination, timestamp, request, statuscode, bytecount, referer and useragent
+        """
+        # For lighttpd/lighty:
+        #   accesslog.format = "%h %V %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\""
+        #
+        # Split everything
+        source, destination, rest = line.split(' ', maxsplit=2)
+        timestamp, rest = rest.split(' [', maxsplit=1)[1].split('] "', maxsplit=1)
+        request, rest = rest.split('" ', maxsplit=1)
+        statuscode, rest = rest.split(' ', maxsplit=1)
+        bytecount, rest = rest.split(' "', maxsplit=1)
+        referer, useragent = rest.split('" "', maxsplit=1)
+        # Postprocessing timestamp (convert to unix timestamp)
+        # dt = datetime.datetime.strptime('30/Sep/2014:23:46:58 +0200', '%d/%b/%Y:%H:%M:%S %z').timetuple()
+        # ts = time.mktime(dt)
+        timestamp = time.mktime(datetime.datetime.strptime(timestamp, '%d/%b/%Y:%H:%M:%S %z').timetuple())
+        # Postprocessing useragent
+        useragent = useragent[:-1]
+        # Return
+        return source, destination, timestamp, request, statuscode, bytecount, referer, useragent
+
+
+    def buildStats(self, con, newCon):
+        """
+        Build stats-tables, using con from the persistent database and newCon for the new entries
+
+        @param con: Connection to persistent database with stats-tables
+        @type con: sqlite3.Connection
+        @param newCon: Connection to database with new entries
+        @type newCon: sqlite3.Connection
+        """
+        self.debug('Building stats-tables')
+        # Get cursors
+        cur = con.cursor()
+        newCur = newCon.cursor()
+        # For table in tables, do this thing
+        tables = ['referer', 'request', 'useragent']
+        for table in tables:
+            self.debug('  Creating stats for column {}'.format(table))
+            # Create table if not exists
+            cur.execute('''CREATE TABLE IF NOT EXISTS stats{} (
+                            id TEXT PRIMARY KEY,
+                            count INTEGER
+                           )'''.format(table))
+            con.commit()
+            # Preparation
+            counts = dict()
+            newCur.execute('SELECT DISTINCT {} FROM logs ORDER BY id ASC'.format(table))
+            resultsRaw = newCur.fetchall()
+            requests = []
+            for result in resultsRaw:   # TODO Optimize (like [i for i in resultsRaw])
+                requests.append(result[0])
+            self.debug('    … with {} unique entries'.format(len(requests)))
+            # Get values
+            for request in requests:
+                newCur.execute('SELECT COUNT(id) FROM logs WHERE {}=?'.format(table), (request, ))
+                result = newCur.fetchone()[0]
+                counts[request] = result
+            # Sort and store
+            genexp = ((key, counts[key]) for key in sorted(counts, key=counts.get, reverse=True))
+            for key, value in genexp:
+                cur.execute('SELECT count FROM stats{} WHERE id=?'.format(table), (key, ))
+                result = cur.fetchone()
+                if result:
+                    cur.execute('REPLACE INTO stats{}(id, count) VALUES(?, ?)'.format(table), (key, value+result[0]))
+                else:
+                    cur.execute('INSERT INTO stats{}(id, count) VALUES(?, ?)'.format(table), (key, value))
+            # Commit changes
+            con.commit()
+        # Build weekday and hour
+        self.debug('  Creating stats for hour and weekday')
+        # Create table if not exists
+        cur.execute('''CREATE TABLE IF NOT EXISTS statshour (
+                        id INTEGER PRIMARY KEY,
+                        count INTEGER
+                       ) ''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS statsweekday (
+                        id INTEGER PRIMARY KEY,
+                        count INTEGER
+                       )''')
+        con.commit()
+        # Preparation
+        countHour = dict()
+        countWeekday = dict()
+        # Get all timestamps
+        newCur.execute('SELECT timestamp FROM logs')
+        resultsRaw = newCur.fetchall()
+        for result in resultsRaw:
+            # Convert to hour, weekday
+            dateTime = datetime.datetime.fromtimestamp(result[0])
+            hour = dateTime.hour
+            weekday = dateTime.weekday()
+            # Update dicts
+            if hour in countHour:
+                countHour[hour] += 1
+            else:
+                countHour[hour] = 1
+            if weekday in countWeekday:
+                countWeekday[weekday] += 1
+            else:
+                countWeekday[weekday] = 1
+        # Insert hours into database
+        for key in countHour:
+            cur.execute('SELECT count FROM statshour WHERE id=?', (key, ))
+            result = cur.fetchone()
+            if result:
+                cur.execute('REPLACE INTO statshour(id, count) VALUES(?, ?)', (key, countHour[key]+result[0]))
+            else:
+                cur.execute('INSERT INTO statshour(id, count) VALUES(?, ?)', (key, countHour[key]))
+        con.commit()
+        # Insert weekdays into database
+        for key in countWeekday:
+            cur.execute('SELECT count FROM statsweekday WHERE id=?', (key, ))
+            result = cur.fetchone()
+            if result:
+                cur.execute('REPLACE INTO statsweekday(id, count) VALUES(?, ?)', (key, countWeekday[key]+result[0]))
+            else:
+                cur.execute('INSERT INTO statsweekday(id, count) VALUES(?, ?)', (key, countWeekday[key]))
+        con.commit()
+        # Commit changes
+        self.debug('  Commit changes')
+        con.commit()
+
+
+    def rebuild(self):
+        """
+        Rebuild stats-tables from ground (for new logfiles building stats is included in --process)
+        (stats-tables are acting as cache reducing database requests)
+        """
+        self.debug('Rebuild stats-tables from ground')
+        # Connect to database
+        self.debug('  Connect to database')
+        con = sqlite3.connect(self.database)
+        cur = con.cursor()
+        # Throw away old tables if they exist
+        tables = ['referer', 'request', 'useragent', 'weekday', 'hour']
+        for table in tables:
+            self.debug('    Drop table {}'.format(table))
+            cur.execute('DROP TABLE IF EXISTS stats{}'.format(table))
+        con.commit()
+        # Call self.buildStats()
+        self.buildStats(con, con)
+        # Disconnect from database
+        self.debug('  Disconnect from database')
+        cur.close()
+        con.close()
+
+
+    def calcStats(self):
+        """
+        Calculate stats and show output
+        """
+        self.debug('Calculating stats and render output')
+        # Connect to database
+        self.debug('  Connect to database')
+        con = sqlite3.connect(self.database)
+        cur = con.cursor()
+        ## 0 | General information
+        # Data
+        cur.execute('SELECT MIN(timestamp) FROM logs')
+        timeMin = cur.fetchone()[0]
+        cur.execute('SELECT MAX(timestamp) FROM logs')
+        timeMax = cur.fetchone()[0]
+        textStart = datetime.datetime.fromtimestamp(timeMin).strftime('%Y-%m-%d %H:%M:%S')
+        textEnd = datetime.datetime.fromtimestamp(timeMax).strftime('%Y-%m-%d %H:%M:%S')
+        textDiff = datetime.timedelta(seconds=(timeMax-timeMin))
+        daysDiff = (timeMax-timeMin)//(24*60*60) # Manually converting difference in seconds to difference in days
+        cur.execute('SELECT COUNT(*) FROM logs')
+        totalRequests = cur.fetchone()[0]
+        cur.execute('SELECT DISTINCT source FROM logs ORDER BY destination ASC')
+        uniqueIps = len(cur.fetchall())
+        if self.anonymizeIp:
+            uniqueIps = int(uniqueIps / 9.2) # A test over 3 month has shown, that anonymizing ip addresses results in ~9.2 times more ip addresses compared to real data
+        # Show
+        print('A few stats extracted from logfiles')
+        print(' Logs begin @ {}'.format(textStart))
+        print(' ...and end @ {}'.format(textEnd))
+        print(' Difference is {}'.format(textDiff))
+        print(' -~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-')
+        print(' {} requests in total'.format(totalRequests))
+        if self.anonymizeIp:
+            print(' Approximately {} unique IP addresses'.format(uniqueIps))
+        else:
+            print(' {} unique IP addresses'.format(uniqueIps))
+        print(' → {:.2f} requests/IP address'.format(totalRequests/uniqueIps))
+        ## 1 | Weekday
+        # Data
+        cur.execute('SELECT id, count FROM statsweekday ORDER BY id ASC')
+        result = cur.fetchall()
+        dataAll = [r[1] for r in result] # Extract r[1] from every entry in result to get a list of counts
+        dataAvg = [r[1]//daysDiff for r in result] # Same as above, but divide with daysDiff to get average
+        labels = ['Monday',
+                  'Tuesday',
+                  'Wednesday',
+                  'Thursday',
+                  'Friday',
+                  'Saturday',
+                  'Sunday']
+        # Show
+        print('')
+        print('Requests based on weekday')
+        print(' Day\t\tTotal\tDaily')
+        print(' ----------------------------')
+        for index, label in enumerate(labels, start=0):
+            print(' {}  \t{}\t{:.0f}'.format(label, dataAll[index], dataAvg[index]))
+        ## 2 | Hour
+        # Data
+        cur.execute('SELECT id, count FROM statshour ORDER BY id ASC')
+        result = cur.fetchall()
+        dataAll = [r[1] for r in result] # Extract r[1] from every entry in result to get a list of counts
+        dataAvg = [r[1]//daysDiff for r in result] # Same as above, but divide with daysDiff to get average
+        # Show
+        print('')
+        print('Requests based on daytime')
+        print(' Hour\tTotal\tDaily')
+        print(' --------------------')
+        for index, value in enumerate(dataAll, start=0):
+            print(' {}-{}\t{}\t{:.0f}'.format(index, index+1, dataAll[index], dataAvg[index]))
+        ## 3 | Domain-chart
+        # Data
+        dataCombined = {'others':totalRequests}
+        for domain in self.domains:
+            cur.execute('SELECT COUNT(*) FROM logs WHERE destination LIKE ?', ('%{}%'.format(domain), ))
+            result = cur.fetchone()[0]
+            dataCombined[domain] = result
+            dataCombined['others'] -= result
+        genexp = ((key, dataCombined[key]) for key in sorted(dataCombined, key=dataCombined.get, reverse=True))
+        data = [] #[key for result[0] in genexp]
+        labels = [] #[value for result[1] in genexp]
+        for key, value in genexp:
+            labels.append(key)
+            data.append(value)
+        # Show
+        print('')
+        print('Requests per domain')
+        print(' Domain\t\tPercentage')
+        print(' -------------------------')
+        for index, label in enumerate(labels, start=0):
+            print(' {} \t{:.1f}%'.format(label, data[index]*100/totalRequests))
+        ## 4 | Payload
+        # Data
+        requests = ['GET /%.html HTTP/1.%',
+                    'GET /%.atom HTTP/1.%',
+                    'GET /%.jpg HTTP/1.%',
+                    'GET /%.png HTTP/1.%',
+                    'GET %/ HTTP/1.%',
+                    'GET / HTTP/1.%']
+        cur.execute('SELECT SUM(bytecount) FROM logs')
+        total = cur.fetchone()[0]
+        dataCombined = {'others':total}
+        for request in requests:
+            cur.execute('SELECT SUM(bytecount) FROM logs WHERE request LIKE "{}"'.format(request))
+            result = cur.fetchone()[0]
+            dataCombined[request] = result
+            dataCombined['others'] -= result
+        genexp = ((key, dataCombined[key]) for key in sorted(dataCombined, key=dataCombined.get, reverse=True))
+        data = []
+        labels = []
+        for key, value in genexp:
+            labels.append(key)
+            data.append(value)
+        # Show
+        print('')
+        print('Transferred payload')
+        print(' Payload\tRequest')
+        print(' ----------------------')
+        for index, label in enumerate(labels, start=0):
+            print(' {}\t{}'.format(self.byte2Whatever(data[index]), label))
+        print(' --------------------')
+        print(' {}\tTotal'.format(self.byte2Whatever(total)))
+        ## 5 | Requests
+        # Data
+        requests = ['GET /%.html HTTP/1.%',
+                    'GET /%.atom HTTP/1.%',
+                    'GET /%.jpg HTTP/1.%',
+                    'GET /%.png HTTP/1.%',
+                    'GET %/ HTTP/1.%',
+                    'GET / HTTP/1.%']
+        cur.execute('SELECT COUNT(id) FROM logs')
+        total = cur.fetchone()[0]
+        dataCombined = {'others':total}
+        for request in requests:
+            cur.execute('SELECT COUNT(id) FROM logs WHERE request LIKE "{}"'.format(request))
+            result = cur.fetchone()[0]
+            dataCombined[request] = result
+            dataCombined['others'] -= result
+        genexp = ((key, dataCombined[key]) for key in sorted(dataCombined, key=dataCombined.get, reverse=True))
+        data = []
+        labels = []
+        for key, value in genexp:
+            labels.append(key)
+            data.append(value)
+        # Show
+        print('')
+        print('Requests')
+        print(' Requests\tRequest ')
+        print(' ----------------------')
+        for index, label in enumerate(labels, start=0):
+            print(' {}\t{}'.format(data[index], label))
+        print(' --------------------')
+        print(' {}\tTotal'.format(total))
+        ## 6 | Top X
+        count = 15
+        # Referer
+        print('')
+        print('Referer')
+        print(' Rank\tCount\tReferer')
+        print(' ----------------------')
+        cur.execute('SELECT count,id FROM statsreferer ORDER BY count DESC LIMIT ?', (count, ))
+        results = cur.fetchall()
+        for index, result in enumerate(results, start=1):
+            print(' {}\t{}\t{}'.format(index, result[0], result[1]))
+        # Requests
+        print('')
+        print('Requests')
+        print(' Rank\tCount\tRequest')
+        print(' ----------------------')
+        cur.execute('SELECT count,id FROM statsrequest ORDER BY count DESC LIMIT ?', (count, ))
+        results = cur.fetchall()
+        for index, result in enumerate(results, start=1):
+            print(' {}\t{}\t{}'.format(index, result[0], result[1]))
+        # Useragents
+        print('')
+        print('Useragents')
+        print(' Rank\tCount\tUseragent')
+        print(' ------------------------')
+        cur.execute('SELECT count,id FROM statsuseragent ORDER BY count DESC LIMIT ?', (count, ))
+        results = cur.fetchall()
+        for index, result in enumerate(results, start=1):
+            print(' {}\t{}\t{}'.format(index, result[0], result[1]))
+        # Disconnect from database
+        self.debug('  Disconnect from database')
+        cur.close()
+        con.close()
+
+
+    def byte2Whatever(self, byte):
+        """
+        Returns a string like 80,00GB
+
+        @return: Bytes converted into string including its unit (KB, MB, GB, etc)
+        """
+        f = {1024:'KB', 1024**2:'MB', 1024**3:'GB', 1024**4:'TB'}
+        for key in f:
+            if 0 < byte//key and byte//key < 1024:
+                return '{:7.2f} {}'.format(byte/key, f[key])
+
+
+    def export(self):
+        """
+        Export nice generated image
+        """
+        ## Imports
+        import shutil
+        import urllib
+        import matplotlib as mpl
+        import matplotlib.font_manager as fm
+        import matplotlib.pyplot as plt
+        from matplotlib import gridspec
+        ## Check if font exists
+        fontpath = os.path.expanduser('~/.fonts/Humor-Sans.ttf')
+        if not os.path.exists(fontpath):
+            # Download
+            url = 'http://antiyawn.com/uploads/Humor-Sans-1.0.ttf'
+            urllib.request.urlretrieve(url, 'Humor-Sans.ttf')
+            # Copy
+            try:
+                os.makedirs(os.path.expanduser('~/.fonts/'))
+            except Exception as e:
+                pass
+            shutil.copy('Humor-Sans.ttf', fontpath)
+            # Remove font cache
+            shutil.rmtree(os.path.expanduser('~/.cache/matplotlib'))
+        ## General setup
+        # Set font
+        prop = fm.FontProperties(fname='Humor-Sans.ttf', size=16)
+        # Set matplotlib parameter
+        mpl.rcParams['font.family'] = prop.get_name() # Humor-Sans.ttf needs to be within ~/.fonts/
+        ## Draw
+        with plt.xkcd(): # Set to xkcd-style
+            fig = plt.figure() # Hierarchy is Figure → Axes (aka Plot) → Axis
+            fig.set_figwidth(self.exportWidth/96) # Set width to (self.exportWidth/96dpi) inches
+            fig.set_figheight(self.exportWidth*2/96) # Set height to (self.exportWidth*2/96dpi) inches
+            # Create subplots
+            gs = gridspec.GridSpec(4, 1, height_ratios=[1, 2, 2, 2])
+            # Connect to database
+            self.debug('  Connect to database')
+            con = sqlite3.connect(self.database)
+            cur = con.cursor()
+            ## Plot 0 general information
+            # Data
+            cur.execute('SELECT MIN(timestamp) FROM logs')
+            timeMin = cur.fetchone()[0]
+            cur.execute('SELECT MAX(timestamp) FROM logs')
+            timeMax = cur.fetchone()[0]
+            textStart = datetime.datetime.fromtimestamp(timeMin).strftime('%Y-%m-%d %H:%M:%S')
+            textEnd = datetime.datetime.fromtimestamp(timeMax).strftime('%Y-%m-%d %H:%M:%S')
+            textDiff = datetime.timedelta(seconds=(timeMax-timeMin))
+            daysDiff = (timeMax-timeMin)//(24*60*60) # Manually converting difference in seconds to difference in days
+            cur.execute('SELECT COUNT(*) FROM logs')
+            totalRequests = cur.fetchone()[0]
+            cur.execute('SELECT DISTINCT source FROM logs ORDER BY destination ASC')
+            uniqueIps = len(cur.fetchall())
+            if self.anonymizeIp:
+                uniqueIps = int(uniqueIps / 9.2) # A test over 3 month has shown, that anonymizing ip addresses results in ~9.2 times more ip addresses compared to real data
+            # Draw
+            ax0 = plt.subplot(gs[0])
+            #ax0.set_title('A few stats about this server', size=24)
+            ax0.set_title('A few stats extracted from logfiles', size=20)
+            if self.anonymizeIp:
+                ax0.text(0, -0.3 ,'Logs begin @ {}\n...and end @ {}\n Difference is {}\n-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-~-\n{} requests in total\nApproximately {} unique IP addresses\n -> {:.2f} requests/IP address'.format(textStart, textEnd, textDiff, totalRequests, uniqueIps, totalRequests/uniqueIps), size=16) # Format: x, y, text
+            else:
+                ax0.text(0, -0.3 ,'Logs begin @ {}\n...and end @ {}\n Difference is {}\n~~~\n{} requests in total\n{} unique IP addresses\n -> {:.2f} requests/IP address'.format(textStart, textEnd, textDiff, totalRequests, uniqueIps, totalRequests/uniqueIps), size=16) # Format: x, y, text
+            ax0.set_axis_off() # Don't draw axis
+            ## Plot 1 weekday
+            # Data
+            cur.execute('SELECT id, count FROM statsweekday ORDER BY id ASC')
+            result = cur.fetchall()
+            dataAll = [r[1] for r in result] # Extract r[1] from every entry in result to get a list of counts
+            dataAvg = [r[1]//daysDiff for r in result] # Same as above, but divide with daysDiff to get average
+            labels = ['',
+                      'Monday',
+                      'Tuesday',
+                      'Wednesday',
+                      'Thursday',
+                      'Friday',
+                      'Saturday',
+                      'Sunday']
+            # Draw
+            ax1 = plt.subplot(gs[1])
+            ax1.set_title('Requests based on weekday', size=20) # Set title
+            ax1.xaxis.set_ticks_position('bottom') # Set ticks to bottom only
+            ax1.set_xticklabels(labels, rotation=30, ha='right')  # Draw weekdays instead of numbers
+            # First plot
+            ax1.set_xlim([0.5, 7.5]) # Set x-axis area
+            ax1.spines['top'].set_color('none') # Remove top border
+            ax1.plot(range(1, 8), dataAll, 'b-o') # b-o means: blue color, interconnect dots, draw dots
+            ax1.set_ylim([0, max(dataAll)*1.1]) # Set scale of y-axis
+            ax1.set_ylabel('Overall number\nof requests (blue)') # Set title of y-axis
+            # Second plot
+            ax11 = ax1.twinx() # Duplicate axes (plot) to draw another plot in the same axes
+            ax11.set_xlim([0.5, 7.5]) # Set x-axis area
+            ax11.spines['top'].set_color('none') # Remove top border
+            ax11.plot(range(1, 8), dataAvg, 'r-o') # r-o means: red color, interconnect dots, draw dots
+            ax11.set_ylim([0, max(dataAvg)*1.5]) # Set scale of y-axis
+            ax11.set_ylabel('Daily number\nof requests (red)') # Set title of y-axis
+            ## Plot 2 hour
+            # Data
+            cur.execute('SELECT id, count FROM statshour ORDER BY id ASC')
+            result = cur.fetchall()
+            dataAll = [r[1] for r in result] # Extract r[1] from every entry in result to get a list of counts
+            dataAvg = [r[1]//daysDiff for r in result] # Same as above, but divide with daysDiff to get average
+            # Draw
+            ax2 = plt.subplot(gs[2])
+            ax2.set_title('Requests based on daytime', size=20) # Set title
+            ax2.xaxis.set_ticks_position('bottom') # Set ticks to bottom only
+            ax2.xaxis.set_ticks(range(0,24)) # Draw a tick for every number (0-23)
+            # First plot
+            ax2.set_xlim([-0.5, 23.5]) # Set x-axis area
+            ax2.spines['top'].set_color('none') # Remove top border
+            ax2.plot(range(0, 24), dataAll, 'b-o') #  b-o menas: blue color, interconnect dots, draw dots
+            ax2.set_ylim([0, max(dataAll)*1.1]) # Set scale of y-axis
+            ax2.set_ylabel('Overall number\nof requests (blue)') # Set title of y-axis
+            # Second plot
+            ax21 = ax2.twinx() # Duplicate axes (plot) to draw another plot in the same axes
+            ax21.set_xlim([-0.5, 23.5]) # Set x-axis area
+            ax21.spines['top'].set_color('none') # Remove top border
+            ax21.plot(range(0, 24), dataAvg, 'r-o') #  b-o menas: blue color, interconnect dots, draw dots
+            ax21.set_ylim([0, max(dataAvg)*1.5]) # Set scale of y-axis
+            ax21.set_ylabel('Daily number\nof requests (red)') # Set title of y-axis
+            ## Plot 3 domain-chart
+            # Data
+            dataCombined = {'others':totalRequests}
+            for domain in self.domains:
+                cur.execute('SELECT COUNT(*) FROM logs WHERE destination LIKE ?', ('%{}%'.format(domain), ))
+                result = cur.fetchone()[0]
+                dataCombined[domain] = result
+                dataCombined['others'] -= result
+            genexp = ((key, dataCombined[key]) for key in sorted(dataCombined, key=dataCombined.get, reverse=True))
+            data = [] #[key for result[0] in genexp]
+            labels = [] #[value for result[1] in genexp]
+            for key, value in genexp:
+                labels.append(key)
+                data.append(value)
+            explode = (0.1, 0.05, 0, 0, 0)[:len(data)][::-1] # Cut so it fits, then reverse
+            colors = ['gold', 'lightskyblue', 'yellowgreen', 'lightcoral', 'purple'][:len(data)] # Cut so it fits
+            # Draw
+            ax3 = plt.subplot(gs[3])
+            ax3.pie(data, explode=explode, labels=labels, colors=colors, autopct='%1.1f%%',  shadow=True, startangle=60)
+            ax3.axis('equal') # draw a circle and not an ellipse
+            ax3.set_title('Requests per domain', size=20) # set title
+            # Disconnect from database
+            self.debug('  Disconnect from database')
+            cur.close()
+            con.close()
+            ## Save
+            plt.tight_layout() # Tight layout, remove overlap
+            imageFolder = os.path.expanduser(self.exportPath)
+            if not os.path.exists(imageFolder):
+                os.makedirs(imageFolder)
+            fig.savefig(os.path.join(imageFolder, 'stats.png'), dpi=96)
+            print('Image saved in {}'.format(imageFolder))
+
+
+## Application
+
+def main():
+    ## Parser
+    # Init parser
+    parser = argparse.ArgumentParser()
+    # Optional arguments
+    parser.add_argument('-v', '--verbose', action='store_true', help='show debug messages')
+    parser.add_argument('-u', '--update', action='store_true', help='download logfiles from remote (server)')
+    parser.add_argument('-p', '--process', action='store_true', help='process new logfiles')
+    parser.add_argument('--rebuild', action='store_true', help='rebuild stats-tables from ground (for new logfiles building stats is included in --process)')
+    parser.add_argument('-s', '--stats', action='store_true', help='calculate stats and show output')
+    parser.add_argument('-e', '--export', action='store_true', help='export nice, generated image')
+    # Get arguments
+    args = parser.parse_args()
+    # Debug?
+    DEBUG = False
+    if args.verbose:        # Verbose
+        DEBUG = True
+    # Everything else
+    showHelp = True
+    l = Logalyze(debug=DEBUG)
+    if args.update:         # Update
+        showHelp = False
+        l.update()
+    if args.process:        # Process
+        showHelp = False
+        l.process()
+    if args.rebuild:        # Rebuild
+        showHelp = False
+        l.rebuild()
+    if args.stats:          # Stats
+        showHelp = False
+        l.calcStats()
+    if args.export:         # Export
+        showHelp = False
+        l.export()
+    # Show help?
+    if showHelp:
+        parser.print_help()
+    # Return
+    return 0
+
+
+if __name__ == '__main__':
+    startTime = time.time()
+    main()
+    print('\nFinished on {} and took {:.2f} seconds'.format(time.ctime(), time.time()-startTime))

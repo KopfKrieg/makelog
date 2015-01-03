@@ -1,0 +1,14 @@
+# Ignore config-file
+makelog.conf
+
+# Ignore database
+makelog.db
+
+# Ignore font
+Humor-Sans.ttf
+
+# Ignore logfile-folder
+logfiles/*
+
+# Ignore export-folder
+export/*
