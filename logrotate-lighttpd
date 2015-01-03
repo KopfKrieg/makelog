@@ -1,0 +1,42 @@
+#
+# /etc/logrotate.d/lighttpd
+#
+
+#/var/log/lighttpd/*.log {
+/var/log/lighttpd/error.log {
+        weekly
+        missingok
+        rotate 12
+        compress
+	delaycompress
+        notifempty
+        sharedscripts
+        postrotate
+             if [ -x /usr/sbin/invoke-rc.d ]; then \
+                invoke-rc.d lighttpd reopen-logs > /dev/null 2>&1; \
+             else \
+                /etc/init.d/lighttpd reopen-logs > /dev/null 2>&1; \
+             fi; \
+        endscript
+}
+/var/log/lighttpd/access.log {
+        weekly
+        missingok
+        rotate 12
+        compress
+	delaycompress
+        notifempty
+        sharedscripts
+        prerotate
+            target="/home/logservice/$(date +%Y-%m-%d)_access.log"
+            cp "/var/log/lighttpd/access.log" $target 
+            chown logservice:logservice $target
+        endscript
+        postrotate
+             if [ -x /usr/sbin/invoke-rc.d ]; then \
+                invoke-rc.d lighttpd reopen-logs > /dev/null 2>&1; \
+             else \
+                /etc/init.d/lighttpd reopen-logs > /dev/null 2>&1; \
+             fi; \
+        endscript
+}
