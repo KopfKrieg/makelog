@@ -283,7 +283,7 @@ class Logalyze:
                     # Split
                     source, destination, timestamp, request, statuscode, bytecount, referer, useragent = self.splitLine(line)
                     if self.anonymizeIp:
-                        source = self.genIp(source)
+                        source = self.cutIp(source)
                     #self.debug('    Info')
                     #self.debug('      source      {}'.format(source))
                     #self.debug('      destination {}'.format(destination))
@@ -321,16 +321,16 @@ class Logalyze:
         cur.close()
         con.close()
 
-    def genIp(self, ip):
+    def cutIp(self, ip):
         """
-        Randomizes the last byte of an IPv4 address
+        Cuts off the last byte of an IPv4 address
 
         @param ip: IP address
         @type ip: str
         @return: IP address where the last byte is randomized
         """
         blocks = ip.split('.')
-        return '{}.{}.{}.{}'.format(blocks[0], blocks[1], blocks[2], random.randint(1,255))
+        return '{}.{}.{}.0'.format(blocks[0], blocks[1], blocks[2])
 
 
     def splitLine(self, line):
